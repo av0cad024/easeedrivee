@@ -1,0 +1,10 @@
+node_modules/
+dist/
+server/easedrive.db
+server/uploads/
+.env
+.env.*
+!.env.example
+*.db-shm
+*.db-wal
+EaseDrive-*.zip

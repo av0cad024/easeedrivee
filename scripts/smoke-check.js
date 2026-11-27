@@ -1,0 +1,81 @@
+import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { createHmac, randomInt } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const temp=await mkdtemp(path.join(os.tmpdir(),'easedrive-smoke-'));
+const dbPath=path.join(temp,'smoke.db');
+const probe=createServer();
+await new Promise(resolve=>probe.listen(0,'127.0.0.1',resolve));
+const port=probe.address().port;
+await new Promise(resolve=>probe.close(resolve));
+const server=spawn(process.execPath,['server/index.js'],{cwd:root,env:{...process.env,PORT:String(port),JWT_SECRET:'smoke-test-secret-at-least-32-characters-long',EASEDRIVE_DB_PATH:dbPath},stdio:'ignore'});
+const base=`http://127.0.0.1:${port}`;
+let finished=false;
+let testDb;
+try {
+  let health;
+  for(let i=0;i<50;i++) { try { health=await fetch(`${base}/api/health`); if(health.ok&&health.headers.get('content-type')?.includes('application/json'))break; } catch {} await new Promise(r=>setTimeout(r,100)); }
+  assert(health?.ok,'API server starts');
+  const call=async (url,{token,...options}={})=>{const response=await fetch(base+url,{...options,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}});const text=await response.text();let data;try{data=JSON.parse(text)}catch{throw Error(`${url} returned ${response.status}: ${text.slice(0,160)}`)}return{status:response.status,data};};
+  const register=async(name,email,role)=>{const r=await call('/api/auth/register',{method:'POST',body:JSON.stringify({name,email,phone:'09171234567',password:'Passw0rd!Secure',role})});assert.equal(r.status,201,`register ${role}: ${JSON.stringify(r.data)}`);return r.data;};
+  const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/FYsAAAAASUVORK5CYII=';
+  const staff=await register('Test Owner','owner@smoke.test','staff');
+  const otherStaff=await register('Other Owner','other-owner@smoke.test','staff');
+  const renter=await register('Test Renter','renter@smoke.test','renter');
+  const ownerRegistration=await call('/api/auth/register',{method:'POST',body:JSON.stringify({name:'Actual Owner',email:'actual-owner@smoke.test',phone:'09281234567',password:'Passw0rd!Secure',role:'owner',address:'123 Test Street, Makati',idDocument:png})});assert.equal(ownerRegistration.status,201,'register owner account');
+  const admin=await register('Test Admin','admin@smoke.test','renter');
+  const recoveryEmail=await call('/api/auth/password-recovery/request',{method:'POST',body:JSON.stringify({identifier:'renter@smoke.test',channel:'email'})});assert.equal(recoveryEmail.status,503,'email recovery reports missing Resend configuration instead of claiming a code was sent');assert.match(recoveryEmail.data.error,/RESEND_API_KEY/);
+  const recoverySms=await call('/api/auth/password-recovery/request',{method:'POST',body:JSON.stringify({identifier:'renter@smoke.test',channel:'sms'})});assert.equal(recoverySms.status,503,'SMS recovery reports missing Twilio configuration instead of claiming a code was sent');assert.match(recoverySms.data.error,/TWILIO_ACCOUNT_SID/);
+  const unknownRecovery=await call('/api/auth/password-recovery/request',{method:'POST',body:JSON.stringify({identifier:'missing@smoke.test',channel:'email'})});assert.equal(unknownRecovery.status,503,'provider configuration failure is returned without checking whether an account exists');
+  const db=testDb=new DatabaseSync(dbPath);db.prepare("UPDATE users SET role='admin',verified=1 WHERE id=?").run(admin.user.id);
+  const newCode=()=>String(randomInt(0,1_000_000)).padStart(6,'0');
+  const seedRecovery=(userId,code,channel='email',expiresAt=Date.now()+300_000)=>db.prepare(`INSERT INTO password_recovery(user_id,channel,otp_hash,expires_at,attempts,sent_at,window_started_at,request_count,delivery_id) VALUES(?,?,?, ?,0,?,?,1,'smoke') ON CONFLICT(user_id) DO UPDATE SET channel=excluded.channel,otp_hash=excluded.otp_hash,expires_at=excluded.expires_at,attempts=0,sent_at=excluded.sent_at,window_started_at=excluded.window_started_at,request_count=1,verified_at=NULL,reset_token_hash=NULL,reset_expires_at=NULL,delivery_id='smoke'`).run(userId,channel,createHmac('sha256','smoke-test-secret-at-least-32-characters-long').update(`password-recovery:${userId}:${code}`).digest('hex'),expiresAt,Date.now(),Date.now());
+  const renterCode=newCode();seedRecovery(renter.user.id,renterCode,'email');
+  const wrongRenterCode=renterCode==='000000'?'000001':'000000';assert.equal((await call('/api/auth/password-recovery/verify',{method:'POST',body:JSON.stringify({identifier:renter.user.email,code:wrongRenterCode})})).status,400,'reject incorrect recovery code');
+  const renterVerified=await call('/api/auth/password-recovery/verify',{method:'POST',body:JSON.stringify({identifier:renter.user.email,code:renterCode})});assert.equal(renterVerified.status,200,'verify renter recovery code');
+  assert.equal((await call('/api/auth/password-recovery/reset',{method:'POST',body:JSON.stringify({resetToken:renterVerified.data.resetToken,password:'weak',confirmPassword:'weak'})})).status,400,'reject weak reset password');
+  const renterNewPassword='NewPassw0rd!Renter';assert.equal((await call('/api/auth/password-recovery/reset',{method:'POST',body:JSON.stringify({resetToken:renterVerified.data.resetToken,password:renterNewPassword,confirmPassword:'DifferentPassw0rd!'})})).status,400,'reject mismatched reset passwords');assert.equal((await call('/api/auth/password-recovery/reset',{method:'POST',body:JSON.stringify({resetToken:renterVerified.data.resetToken,password:renterNewPassword,confirmPassword:renterNewPassword})})).status,200,'reset renter password');
+  assert.equal((await call('/api/auth/login',{method:'POST',body:JSON.stringify({email:renter.user.email,password:renterNewPassword})})).status,200,'renter can log in with reset password');
+  const ownerCode=newCode();seedRecovery(ownerRegistration.data.user.id,ownerCode,'sms');const ownerVerified=await call('/api/auth/password-recovery/verify',{method:'POST',body:JSON.stringify({identifier:'+63 928 123 4567',code:ownerCode})});assert.equal(ownerVerified.status,200,`verify owner recovery code: ${JSON.stringify(ownerVerified.data)}`);const ownerNewPassword='NewPassw0rd!Owner';assert.equal((await call('/api/auth/password-recovery/reset',{method:'POST',body:JSON.stringify({resetToken:ownerVerified.data.resetToken,password:ownerNewPassword,confirmPassword:ownerNewPassword})})).status,200);assert.equal((await call('/api/auth/login',{method:'POST',body:JSON.stringify({email:ownerRegistration.data.user.email,password:ownerNewPassword})})).status,200,'owner can log in with reset password');
+  const adminCode=newCode();seedRecovery(admin.user.id,adminCode,'email');const adminVerified=await call('/api/auth/password-recovery/verify',{method:'POST',body:JSON.stringify({identifier:admin.user.email,code:adminCode})});assert.equal(adminVerified.status,200,'verify administrator recovery code');const adminNewPassword='NewPassw0rd!Admin';assert.equal((await call('/api/auth/password-recovery/reset',{method:'POST',body:JSON.stringify({resetToken:adminVerified.data.resetToken,password:adminNewPassword,confirmPassword:adminNewPassword})})).status,200);assert.equal((await call('/api/auth/login',{method:'POST',body:JSON.stringify({email:admin.user.email,password:adminNewPassword})})).status,200,'administrator can log in with reset password');
+  const expiredCode=newCode();seedRecovery(otherStaff.user.id,expiredCode,'sms',Date.now()-1);assert.equal((await call('/api/auth/password-recovery/verify',{method:'POST',body:JSON.stringify({identifier:otherStaff.user.email,code:expiredCode})})).status,400,'reject expired recovery code');
+  const lockedCode=newCode();seedRecovery(otherStaff.user.id,lockedCode);for(let i=0;i<5;i++){let wrong=newCode();while(wrong===lockedCode)wrong=newCode();assert.equal((await call('/api/auth/password-recovery/verify',{method:'POST',body:JSON.stringify({identifier:otherStaff.user.email,code:wrong})})).status,400)}assert.equal((await call('/api/auth/password-recovery/verify',{method:'POST',body:JSON.stringify({identifier:otherStaff.user.email,code:lockedCode})})).status,400,'lock out OTP after five incorrect attempts');db.close();
+  const login=await call('/api/auth/login',{method:'POST',body:JSON.stringify({email:'admin@smoke.test',password:adminNewPassword})});assert.equal(login.status,200);const adminToken=login.data.token;
+  assert.equal((await call('/api/vehicles',{token:staff.token,method:'POST',body:JSON.stringify({name:'Invalid Upload',brand:'Test',model:'Test',type:'Sedan',location:'Makati',pricePerDay:1000,seats:4,transmission:'Automatic',imageUploads:[{name:'fake.png',data:`data:image/png;base64,${'A'.repeat(60)}`}],primaryIndex:0})})).status,400,'server rejects image files with invalid signatures');
+  const vehicle=await call('/api/vehicles',{token:staff.token,method:'POST',body:JSON.stringify({name:'Smoke Toyota Vios',brand:'Toyota',model:'Vios',type:'Sedan',location:'Makati',pricePerDay:2500,seats:5,transmission:'Automatic',description:'Smoke flow vehicle',imageUploads:[{name:'front.png',data:png},{name:'side.png',data:png}],primaryIndex:1})});assert.equal(vehicle.status,201);
+  const overview=await call('/api/admin/overview',{token:adminToken});const vehicleId=overview.data.vehicles.find(v=>v.name==='Smoke Toyota Vios').id;
+  assert.equal((await call(`/api/admin/vehicles/${vehicleId}`,{token:adminToken,method:'PATCH',body:JSON.stringify({status:'active'})})).status,409,'listing cannot go live before its photos are reviewed');for(const img of overview.data.vehicles.find(v=>v.id===vehicleId).images)assert.equal((await call(`/api/admin/images/${img.id}/review`,{token:adminToken,method:'PATCH',body:JSON.stringify({status:'approved'})})).status,200,'administrator reviews each uploaded photo');
+  const own=(await call('/api/my-vehicles',{token:staff.token})).data.vehicles[0];assert.equal(own.images.length,2,'owner sees all associated photos');assert.equal((await call('/api/my-vehicles',{token:otherStaff.token})).data.vehicles.length,0,'another owner cannot see this vehicle');assert.equal((await call(`/api/vehicles/${vehicleId}/images/${own.images[0].id}`,{token:otherStaff.token,method:'DELETE'})).status,404,'another owner cannot remove its photos');
+  const order=[own.images[1].id,own.images[0].id];assert.equal((await call(`/api/vehicles/${vehicleId}/images/order`,{token:staff.token,method:'PATCH',body:JSON.stringify({orderedIds:order,primaryId:order[0]})})).status,200,'owner can reorder and change the primary photo');
+  assert.equal((await call(`/api/admin/vehicles/${vehicleId}`,{token:adminToken,method:'PATCH',body:JSON.stringify({status:'active'})})).status,200);
+  assert.equal((await call('/api/vehicles')).data.vehicles.length,1,'approved listing is public');
+  const gallery=(await call(`/api/vehicles/${vehicleId}`)).data.vehicle.images;assert.equal(gallery.length,2,'vehicle gallery loads all submitted photos');assert.equal(gallery[0].is_primary,1,'owner-selected primary photo is retained');const storedPhoto=await fetch(base+gallery[0].image_url);assert.equal(storedPhoto.status,200,'uploaded photo is served from its stored association');
+  const dates={vehicleId,pickup:'2030-05-01',returnDate:'2030-05-04'};
+  assert.equal((await call('/api/availability',{method:'POST',body:JSON.stringify(dates)})).data.available,true);
+  const booking=await call('/api/bookings',{token:renter.token,method:'POST',body:JSON.stringify(dates)});assert.equal(booking.status,201);assert.equal(booking.data.booking.total,7875);
+  assert.equal((await call('/api/availability',{method:'POST',body:JSON.stringify(dates)})).data.available,false,'overlapping booking is blocked');
+  const bookingId=booking.data.booking.id;
+  assert.equal((await call(`/api/payments/${bookingId}/proof`,{token:renter.token,method:'POST',body:JSON.stringify({proofUrl:'https://example.test/receipt/one'})})).status,200);
+  assert.equal((await call(`/api/admin/payments/${bookingId}/verify`,{token:adminToken,method:'PATCH',body:JSON.stringify({status:'successful'})})).status,200);
+  assert.equal((await call(`/api/bookings/${bookingId}/status`,{token:staff.token,method:'PATCH',body:JSON.stringify({status:'confirmed'})})).status,200);
+  assert.equal((await call(`/api/bookings/${bookingId}/status`,{token:staff.token,method:'PATCH',body:JSON.stringify({status:'active',condition:'Clean and undamaged at handover'})})).status,200);
+  assert.equal((await call(`/api/bookings/${bookingId}/status`,{token:staff.token,method:'PATCH',body:JSON.stringify({status:'completed',condition:'Returned clean with no new damage'})})).status,200);
+  assert.equal((await call('/api/reviews',{token:renter.token,method:'POST',body:JSON.stringify({bookingId,rating:5,comment:'Great trip'})})).status,201);
+  assert.equal((await call(`/api/messages/${bookingId}`,{token:renter.token,method:'POST',body:JSON.stringify({body:'Thanks for the trip!'})})).status,201);
+  assert.equal((await call(`/api/messages/${bookingId}`,{token:staff.token})).data.messages.length,1,'booking messages are shared only with participants');
+  assert.equal((await call('/api/admin/overview',{token:staff.token})).status,403,'admin endpoints reject staff');
+  assert.equal((await call('/api/dashboard',{token:adminToken})).data.completed,1,'dashboard reads live database values');
+  finished=true;console.log('EaseDrive smoke flow passed: signup/login and roles; recovery provider configuration errors, OTP verification, expired and incorrect code rejection, attempt limits, password strength/match validation, password reset for renter/owner/admin, and login with new passwords; vehicle photo upload/moderation, bookings, payment review, rental lifecycle, reviews, messaging, and role restrictions. Email/SMS provider delivery was not tested because Resend and Twilio credentials are not configured.');
+} finally {
+  try { testDb?.close(); } catch {}
+  if(server.exitCode===null) { server.kill(); await new Promise(resolve=>server.once('exit',resolve)); }
+  await rm(temp,{recursive:true,force:true,maxRetries:5,retryDelay:100});
+  if(!finished) process.exitCode=1;
+}
